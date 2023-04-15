@@ -25,7 +25,7 @@ class DropPath(tf.keras.layers.Layer):
 
         else:
             if self.survival_prob == 0.:
-                residual = tf.zeros_like(inputs)
+                return inputs
             else:
                 survival_state = tf.random.uniform(
                     shape=(), minval=0., maxval=1., dtype=tf.float32
@@ -33,11 +33,10 @@ class DropPath(tf.keras.layers.Layer):
 
                 residual = tf.cond(
                     survival_state,
-                    lambda: inputs / tf.cast(self.survival_prob, tf.float32),
+                    lambda: self.module(inputs) - inputs,
                     lambda: tf.zeros_like(inputs)
                 )
-
-            return self.module(inputs, *args, **kwargs) + residual
+                return (inputs + residual) / self.survival_prob
 
 
 class LinearProj(tf.keras.layers.Layer):
