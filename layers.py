@@ -20,7 +20,7 @@ class DropPath(tf.keras.layers.Layer):
     ) -> tf.Tensor:
         training = training or False
 
-        if self.survival_prob == 1. or training:
+        if self.survival_prob == 1. or not training:
             return self.module(inputs, *args, **kwargs)
 
         else:
@@ -31,12 +31,12 @@ class DropPath(tf.keras.layers.Layer):
                     shape=(), minval=0., maxval=1., dtype=tf.float32
                 ) < self.survival_prob
 
-                residual = tf.cond(
+                output = tf.cond(
                     survival_state,
-                    lambda: self.module(inputs) - inputs,
-                    lambda: tf.zeros_like(inputs)
+                    lambda: inputs + ((self.module(inputs) - inputs) / tf.cast(self.survival_prob, tf.float32)),
+                    lambda: inputs
                 )
-                return (inputs + residual) / self.survival_prob
+                return output
 
 
 class LinearProj(tf.keras.layers.Layer):
@@ -97,12 +97,14 @@ class MHSA(tf.keras.layers.Layer):
         self.n_heads = n_heads
 
     def build(self, input_shape: tf.TensorShape):
-        self.ln = tf.keras.layers.LayerNormalization()
-        self.to_qkv = tf.keras.layers.Dense(input_shape[-1] * 3, use_bias=False)
-        self.to_out = tf.keras.layers.Dense(input_shape[-1], use_bias=False)
+        self.to_qkv = tf.keras.Sequential([
+            tf.keras.layers.LayerNormalization(),
+            tf.keras.layers.Dense(input_shape[-1] * 3, use_bias=False)
+        ])
+        self.to_out = tf.keras.layers.Dense(input_shape[-1])
 
     def call(self, inputs: tf.Tensor, *args, **kwargs) -> tf.Tensor:
-        qkv = self.to_qkv(self.ln(inputs))
+        qkv = self.to_qkv(inputs)
         q, k, v = tf.split(qkv, 3, axis=-1)
         q = rearrange(q, 'b n (h d) -> b h n d', h=self.n_heads)
         k = rearrange(k, 'b n (h d) -> b h n d', h=self.n_heads)

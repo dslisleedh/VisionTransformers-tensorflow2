@@ -48,5 +48,7 @@ if __name__ == '__main__':
 
     inputs = tf.random.normal((1, 224, 224, 3))
 
-    outputs = model(inputs)
-    print(outputs.shape)
+    outputs = model(inputs, training=False)
+    print(outputs.shape, 'Training False')
+    outputs = model(inputs, training=True)
+    print(outputs.shape, 'Training True')
