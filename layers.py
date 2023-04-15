@@ -1,135 +1,148 @@
 import tensorflow as tf
-import numpy as np
 from einops import rearrange
-import math
+
+import numpy as np
+
+from typing import Sequence, Optional
 
 
-class Droppath(tf.keras.layers.Layer):
-    def __init__(self, survivla_prob):
-        super(Droppath, self).__init__()
-        self.survivla_prob = survivla_prob
+class DropPath(tf.keras.layers.Layer):
+    def __init__(
+            self, module: tf.keras.layers.Layer, survival_prob: float = 0., **kwargs
+    ):
+        super(DropPath, self).__init__(**kwargs)
+        self.module = module
+        self.survival_prob = survival_prob
 
-    @tf.function
-    def call(self, inputs, **kwargs):
-        if self.survivla_prob == 1.:
-            return inputs
-        if self.survivla_prob == 0.:
-            return tf.zeros_like(inputs)
+    def call(
+            self, inputs: tf.Tensor, training: Optional[bool] = None,
+            *args, **kwargs
+    ) -> tf.Tensor:
+        training = training or False
 
-        if tf.keras.backend.learning_phase():
-            epsilon = tf.keras.backend.random_bernoulli(shape=[tf.shape(inputs)[0]] + [1 for _ in range(len(tf.shape(inputs)) - 1)],
-                                                        p=self.survivla_prob,
-                                                        dtype='float32'
-                                                        )
-            return inputs * epsilon
+        if self.survival_prob == 1. or training:
+            return self.module(inputs, *args, **kwargs)
+
         else:
-            return inputs * self.survivla_prob
+            if self.survival_prob == 0.:
+                residual = tf.zeros_like(inputs)
+            else:
+                survival_state = tf.random.uniform(
+                    shape=(), minval=0., maxval=1., dtype=tf.float32
+                ) < self.survival_prob
+
+                residual = tf.cond(
+                    survival_state,
+                    lambda: inputs / tf.cast(self.survival_prob, tf.float32),
+                    lambda: tf.zeros_like(inputs)
+                )
+
+            return self.module(inputs, *args, **kwargs) + residual
 
 
-class PositionalEncoding(tf.keras.layers.Layer):
-    def __init__(self,
-                 n_filters,
-                 n_patches
-                 ):
-        super(PositionalEncoding, self).__init__()
+class LinearProj(tf.keras.layers.Layer):
+    def __init__(self, n_filters: int, patch_size: Sequence[int], **kwargs):
+        super(LinearProj, self).__init__(**kwargs)
         self.n_filters = n_filters
-        self.n_patches = n_patches
+        self.patch_size = patch_size
 
-        pe = tf.Variable(
-            initial_value=tf.concat([
-                self.positional_encoding(i) for i in range(self.n_patches)
-            ], axis=0),
-            trainable=False
-        )
-        self.pe = tf.cast(pe, dtype=tf.float32)
-
-    def positional_encoding(self, pos):
-        pe = np.zeros(self.n_filters)
-        for i in range(0, self.n_filters, 2):
-            pe[i] = np.math.sin(pos / (10000 ** ((2 * i) / self.n_filters)))
-            pe[i + 1] = np.math.cos(pos / (10000 ** ((2 * i) / self.n_filters)))
-        return np.expand_dims(pe, 0)
-
-    def call(self, inputs, *args, **kwargs):
-        return inputs + self.pe
-
-
-class ChannelMLP(tf.keras.layers.Layer):
-    def __init__(self,
-                 n_filters,
-                 expansion_rate=4
-                 ):
-        super(ChannelMLP, self).__init__()
-        self.n_filters = n_filters
-        self.expansion_rate = expansion_rate
-
+    def build(self, input_shape: tf.TensorShape):
         self.forward = tf.keras.Sequential([
-            tf.keras.layers.Dense(self.n_filters * self.expansion_rate,
-                                  activation='gelu'
-                                  ),
-            tf.keras.layers.Dense(self.n_filters)
+            tf.keras.layers.Conv2D(
+                self.n_filters, self.patch_size, strides=self.patch_size, padding='VALID'
+            ),
+            tf.keras.layers.Reshape((-1, self.n_filters))
         ])
 
-    def call(self, inputs, *args, **kwargs):
+    def call(self, inputs: tf.Tensor, *args, **kwargs) -> tf.Tensor:
         return self.forward(inputs)
 
 
-class ScaledDotProductAttention(tf.keras.layers.Layer):
-    def __init__(self,
-                 n_filters,
-                 n_heads
-                 ):
-        super(ScaledDotProductAttention, self).__init__()
-        self.n_filters = n_filters
+class CLSToken(tf.keras.layers.Layer):
+    def __init__(self, **kwargs):
+        super(CLSToken, self).__init__(**kwargs)
+
+    def build(self, input_shape: tf.TensorShape):
+        self.cls_token = self.add_weight(
+            name='cls_token',
+            shape=(1, 1, input_shape[-1]),
+            initializer=tf.keras.initializers.truncated_normal(stddev=0.02),
+            trainable=True
+        )
+
+    def call(self, inputs: tf.Tensor, *args, **kwargs) -> tf.Tensor:
+        shape = tf.shape(inputs)
+        cls_token = tf.broadcast_to(self.cls_token, (shape[0], 1, shape[-1]))
+        return tf.concat([cls_token, inputs], axis=1)
+
+
+class PosEnc(tf.keras.layers.Layer):
+    def __init__(self, **kwargs):
+        super(PosEnc, self).__init__(**kwargs)
+
+    def build(self, input_shape: tf.TensorShape):
+        self.pos_enc = self.add_weight(
+            name='pos_enc',
+            shape=(1, input_shape[1], input_shape[-1]),
+            initializer=tf.keras.initializers.truncated_normal(stddev=0.02),
+            trainable=True
+        )
+
+    def call(self, inputs: tf.Tensor, *args, **kwargs) -> tf.Tensor:
+        return inputs + self.pos_enc
+
+
+class MHSA(tf.keras.layers.Layer):
+    def __init__(self, n_heads: int, **kwargs):
+        super(MHSA, self).__init__(**kwargs)
         self.n_heads = n_heads
-        self.scale = tf.sqrt(self.n_filters / self.n_heads)
 
-        self.to_qkv = tf.keras.layers.Dense(self.n_filters * 3,
-                                            activation='linear'
-                                            )
+    def build(self, input_shape: tf.TensorShape):
+        self.ln = tf.keras.layers.LayerNormalization()
+        self.to_qkv = tf.keras.layers.Dense(input_shape[-1] * 3, use_bias=False)
+        self.to_out = tf.keras.layers.Dense(input_shape[-1], use_bias=False)
 
-    def to_heads(self, x):
-        return rearrange(x, 'b p (h c) -> b h p c',
-                         h=self.n_heads
-                         )
+    def call(self, inputs: tf.Tensor, *args, **kwargs) -> tf.Tensor:
+        qkv = self.to_qkv(self.ln(inputs))
+        q, k, v = tf.split(qkv, 3, axis=-1)
+        q = rearrange(q, 'b n (h d) -> b h n d', h=self.n_heads)
+        k = rearrange(k, 'b n (h d) -> b h n d', h=self.n_heads)
+        v = rearrange(v, 'b n (h d) -> b h n d', h=self.n_heads)
 
-    def call(self, inputs, *args, **kwargs):
-        q, k, v = tf.split(self.to_qkv(inputs),
-                           num_or_size_splits=3,
-                           axis=-1
-                           )
-        q, k, v = [self.to_heads(qkv) for qkv in [q, k, v]]
+        score = tf.matmul(q, k, transpose_b=True) / tf.math.sqrt(tf.cast(k.shape[-1], tf.float32))
+        attn = tf.nn.softmax(score, axis=-1)
+        out = tf.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = self.to_out(out)
+        return out
 
-        attention_map = tf.matmul(q, k,
-                                  transpose_b=True
-                                  )
-        attention_map = attention_map / self.scale
-        attention_map = tf.nn.softmax(attention_map, axis=-1)
 
-        v = tf.matmul(attention_map, v)
-        return rearrange(v, 'b h p c -> b p (h c)')
+class MLP(tf.keras.layers.Layer):
+    def __init__(self, exp_ratio: int, **kwargs):
+        super(MLP, self).__init__(**kwargs)
+        self.exp_ratio = exp_ratio
+
+    def build(self, input_shape: tf.TensorShape):
+        self.forward = tf.keras.Sequential([
+            tf.keras.layers.LayerNormalization(),
+            tf.keras.layers.Dense(input_shape[-1] * self.exp_ratio, activation='gelu'),
+            tf.keras.layers.Dense(input_shape[-1])
+        ])
+
+    def call(self, inputs: tf.Tensor, *args, **kwargs) -> tf.Tensor:
+        return self.forward(inputs)
 
 
 class EncoderBlock(tf.keras.layers.Layer):
-    def __init__(self,
-                 n_filters,
-                 n_heads,
-                 survival_prob
-                 ):
-        super(EncoderBlock, self).__init__()
-        self.n_filters = n_filters
+    def __init__(self, n_heads: int, exp_ratio: int, drop_probs: np.ndarray, **kwargs):
+        super(EncoderBlock, self).__init__(**kwargs)
         self.n_heads = n_heads
-        self.survival_prob = survival_prob
+        self.exp_ratio = exp_ratio
+        self.drop_probs = drop_probs
 
-        self.ln1 = tf.keras.layers.LayerNormalization()
-        self.spatial = ScaledDotProductAttention(self.n_filters,
-                                                 self.n_heads
-                                                 )
-        self.ln2 = tf.keras.layers.LayerNormalization()
-        self.channel = ChannelMLP(self.n_filters)
-        self.droppath = Droppath(self.survival_prob)
+    def build(self, input_shape: tf.TensorShape):
+        self.mhsa = DropPath(MHSA(self.n_heads), self.drop_probs[0])
+        self.mlp = DropPath(MLP(self.exp_ratio), self.drop_probs[1])
 
-    def call(self, inputs, *args, **kwargs):
-        inputs = self.droppath(self.spatial(self.ln1(inputs))) + inputs
-        inputs = self.droppath(self.channel(self.ln2(inputs))) + inputs
-        return inputs
+    def call(self, inputs: tf.Tensor, *args, **kwargs) -> tf.Tensor:
+        return self.mlp(self.mhsa(inputs))
